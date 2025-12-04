@@ -2,6 +2,7 @@ python-multipart
 
 fastapi
 uvicorn
-easyocr
+paddleocr
+paddlepaddle
 pillow
 numpy

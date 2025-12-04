@@ -1,165 +1,163 @@
 from fastapi import FastAPI, UploadFile, File
-import easyocr
-import uvicorn
+from paddleocr import PaddleOCR
+from PIL import Image, ImageEnhance, ImageOps
+from contextlib import asynccontextmanager
+import io
 import numpy as np
-from PIL import Image
-from io import BytesIO
+import logging
 
-app = FastAPI()
-reader = easyocr.Reader(['en', 'vi'])
+# Tắt log rác
+logging.getLogger("ppocr").setLevel(logging.ERROR)
 
-def group_texts_by_lines(texts, y_threshold=10):
+ocr_model = None
+
+def preprocess_image(image: Image.Image) -> np.ndarray:
     """
-    Nhóm các text OCR theo từng dòng dựa trên tọa độ y của bbox.
-    
-    Args:
-        texts: List các dict chứa text, confidence, bbox
-        y_threshold: Khoảng cách y tối đa để coi là cùng dòng (pixels)
-    
-    Returns:
-        List các dict chứa line_number, line_text, confidence (trung bình), bbox (toàn dòng)
+    Tiền xử lý ảnh chuyên sâu hơn cho tiếng Việt
     """
-    if not texts:
-        return []
-    
-    # Tính y-center cho mỗi text
-    text_with_y = []
-    for text_item in texts:
-        bbox = text_item['bbox']
-        # Tính y-center từ bbox (bbox là 4 điểm: top-left, top-right, bottom-right, bottom-left)
-        y_coords = [point[1] for point in bbox]
-        y_center = sum(y_coords) / len(y_coords)
-        y_min = min(y_coords)
-        y_max = max(y_coords)
-        
-        text_with_y.append({
-            **text_item,
-            'y_center': y_center,
-            'y_min': y_min,
-            'y_max': y_max,
-            'x_min': min([point[0] for point in bbox]),
-            'x_max': max([point[0] for point in bbox])
-        })
-    
-    # Sắp xếp theo y-center (từ trên xuống)
-    text_with_y.sort(key=lambda x: x['y_center'])
-    
-    # Nhóm các text cùng dòng
-    lines = []
-    current_line = []
-    current_y_center = None
-    
-    for item in text_with_y:
-        if current_y_center is None:
-            # Dòng đầu tiên
-            current_line = [item]
-            current_y_center = item['y_center']
-        elif abs(item['y_center'] - current_y_center) <= y_threshold:
-            # Cùng dòng
-            current_line.append(item)
-            # Cập nhật y_center trung bình của dòng
-            current_y_center = sum([t['y_center'] for t in current_line]) / len(current_line)
-        else:
-            # Dòng mới
-            if current_line:
-                lines.append(current_line)
-            current_line = [item]
-            current_y_center = item['y_center']
-    
-    # Thêm dòng cuối cùng
-    if current_line:
-        lines.append(current_line)
-    
-    # Xử lý từng dòng: sắp xếp theo x và nối text
-    result_lines = []
-    for line_num, line_items in enumerate(lines, 1):
-        # Sắp xếp các text trong dòng theo x từ trái sang phải
-        line_items.sort(key=lambda x: x['x_min'])
-        
-        # Nối các text lại với nhau
-        line_text = ' '.join([item['text'] for item in line_items])
-        
-        # Tính confidence trung bình
-        avg_confidence = sum([item['confidence'] for item in line_items]) / len(line_items)
-        
-        # Tính bbox của toàn dòng (bounding box bao quanh tất cả text trong dòng)
-        x_min = min([item['x_min'] for item in line_items])
-        x_max = max([item['x_max'] for item in line_items])
-        y_min = min([item['y_min'] for item in line_items])
-        y_max = max([item['y_max'] for item in line_items])
-        
-        line_bbox = [
-            [x_min, y_min],  # top-left
-            [x_max, y_min],  # top-right
-            [x_max, y_max],  # bottom-right
-            [x_min, y_max]   # bottom-left
-        ]
-        
-        result_lines.append({
-            "line_number": line_num,
-            "text": line_text,
-            "confidence": float(avg_confidence),
-            "bbox": line_bbox,
-            "word_count": len(line_items)
-        })
-    
-    return result_lines
-
-@app.post("/ocr")
-async def ocr_image(file: UploadFile = File(...)):
-    # Read file content as bytes
-    contents = await file.read()
-    
-    # Validate that we have content
-    if not contents:
-        return {"success": False, "error": "Empty file uploaded"}
-    
-    # Create BytesIO object and ensure it's at the beginning
-    image_bytes = BytesIO(contents)
-    image_bytes.seek(0)
-    
-    # Open image from bytes
-    try:
-        image = Image.open(image_bytes)
-        # Verify it's a valid image by loading it
-        image.verify()
-    except Exception as e:
-        return {"success": False, "error": f"Cannot identify image file: {str(e)}"}
-    
-    # Reopen image after verify (verify closes the image)
-    image_bytes.seek(0)
-    image = Image.open(image_bytes)
-    
-    # Convert to RGB if necessary (handles RGBA, P, etc.)
+    # 1. Chuyển hệ màu
     if image.mode != 'RGB':
         image = image.convert('RGB')
     
-    image_np = np.array(image)
+    # 2. Thêm viền trắng (Padding)- Giúp model không bị mất chữ nằm sát mép ảnh
+    image = ImageOps.expand(image, border=20, fill='white')
 
-    result = reader.readtext(image_np, detail=1)
-
-    # Chuyển đổi kết quả OCR sang format chuẩn và lọc theo confidence >= 0.7
-    texts = []
-    min_confidence = 0.7
-    for bbox, text, confidence in result:
-        # Chỉ lấy kết quả có confidence >= 0.7 (70%)
-        if confidence >= min_confidence:
-            # Convert numpy arrays to lists and numpy scalars to Python types
-            bbox_list = [[float(coord) for coord in point] for point in bbox]
-            texts.append({
-                "text": text,
-                "confidence": float(confidence),
-                "bbox": bbox_list
-            })
-
-    # Nhóm các text theo từng dòng
-    lines = group_texts_by_lines(texts, y_threshold=10)
+    # 3. Tăng tương phản (Contrast)
+    enhancer = ImageEnhance.Contrast(image)
+    image = enhancer.enhance(1.5)  # Tăng mạnh hơn chút để tách chữ khỏi nền
     
-    # Lọc lại các dòng có confidence trung bình >= 0.7 (để đảm bảo chính xác)
-    lines = [line for line in lines if line['confidence'] >= min_confidence]
+    # 4. Tăng độ sắc nét (Sharpness)
+    enhancer = ImageEnhance.Sharpness(image)
+    image = enhancer.enhance(1.5)
 
-    return {"success": True, "results": lines}
+    # 5. Resize thông minh (nếu ảnh quá nhỏ)
+    width, height = image.size
+    if min(width, height) < 500: # Nếu ảnh nhỏ hơn 500px chiều ngắn nhất
+        scale = 2
+        image = image.resize((width * scale, height * scale), Image.Resampling.LANCZOS)
+    
+    return np.array(image)
 
+def group_text_into_lines(boxes, texts, scores, threshold_y=10):
+    """
+    Thuật toán gộp các từ riêng lẻ thành dòng dựa trên tọa độ Y.
+    boxes: danh sách các numpy array tọa độ
+    texts: danh sách nội dung chữ
+    scores: độ tin cậy
+    threshold_y: độ lệch Y cho phép để coi là cùng 1 dòng (pixel)
+    """
+    # Tạo danh sách các item gồm (box, text, score, center_y, min_x)
+    items = []
+    for box, text, score in zip(boxes, texts, scores):
+        if score < 0.5: continue # Lọc tin cậy thấp
+        
+        # box là array 4 điểm [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+        # Tính Y trung bình của box để xác định vị trí dòng
+        center_y = np.mean(box[:, 1]) 
+        min_x = np.min(box[:, 0])
+        items.append({'text': text, 'center_y': center_y, 'min_x': min_x})
 
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Sắp xếp tất cả theo thứ tự từ trên xuống dưới (Center Y)
+    items.sort(key=lambda x: x['center_y'])
+
+    lines = []
+    if not items:
+        return lines
+
+    current_line = [items[0]]
+    
+    # Duyệt qua các item còn lại để gom nhóm
+    for item in items[1:]:
+        last_item = current_line[-1]
+        
+        # Nếu item này có Y gần bằng item trước đó -> Cùng 1 dòng
+        if abs(item['center_y'] - last_item['center_y']) < threshold_y:
+            current_line.append(item)
+        else:
+            # Kết thúc dòng cũ, xử lý sắp xếp trái -> phải
+            current_line.sort(key=lambda x: x['min_x'])
+            lines.append(" ".join([i['text'] for i in current_line]))
+            
+            # Bắt đầu dòng mới
+            current_line = [item]
+    
+    # Đừng quên dòng cuối cùng
+    if current_line:
+        current_line.sort(key=lambda x: x['min_x'])
+        lines.append(" ".join([i['text'] for i in current_line]))
+        
+    return lines
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ocr_model
+    try:
+        import paddle
+        if paddle.device.is_compiled_with_cuda():
+             paddle.device.set_device("gpu")
+        else:
+             paddle.device.set_device("cpu")
+        
+        # Tinh chỉnh tham số detection để bắt chữ tiếng Việt tốt hơn
+        ocr_model = PaddleOCR(
+            use_angle_cls=True, 
+            lang="vi",
+            det_db_thresh=0.3,    # Ngưỡng phát hiện (thấp hơn để bắt nét mờ)
+            det_db_box_thresh=0.5,# Ngưỡng box
+            det_db_unclip_ratio=1.6 # Tỉ lệ mở rộng box (giúp bắt đủ dấu tiếng Việt)
+        )
+    except Exception as e:
+        pass
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/ocr")
+async def ocr_image(file: UploadFile = File(...)):
+    if ocr_model is None:
+        return {"error": "Model chưa được khởi tạo."}
+
+    try:
+        image_bytes = await file.read()
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_np = preprocess_image(image)
+    except Exception as e:
+        return {"error": f"Lỗi đọc file ảnh: {e}"}
+
+    try:
+        # Chạy OCR
+        result = ocr_model.ocr(image_np)
+        
+        final_lines = []
+        
+        if result and isinstance(result, list) and len(result) > 0:
+            page_data = result[0]
+            
+            # Xử lý Dictionary format (như log bạn cung cấp)
+            if isinstance(page_data, dict):
+                texts = page_data.get('rec_texts', [])
+                scores = page_data.get('rec_scores', [])
+                boxes = page_data.get('dt_polys', []) # Lấy tọa độ để sắp xếp
+                
+                if len(boxes) > 0 and len(texts) == len(boxes):
+                    # Gọi hàm gộp dòng thông minh
+                    final_lines = group_text_into_lines(boxes, texts, scores)
+                else:
+                    # Fallback nếu không có box (ít xảy ra)
+                    final_lines = texts
+
+            # Xử lý List format (Dự phòng cho phiên bản cũ/khác)
+            elif isinstance(page_data, list):
+                boxes = [line[0] for line in page_data]
+                texts = [line[1][0] for line in page_data]
+                scores = [line[1][1] for line in page_data]
+                final_lines = group_text_into_lines(boxes, texts, scores)
+
+        return {
+            "status": "success",
+            "count_lines": len(final_lines),
+            "text": final_lines
+        }
+
+    except Exception as e:
+        return {"error": f"Lỗi xử lý OCR: {str(e)}"}
