@@ -112,6 +112,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.get("/health")
+async def health_check():
+    """
+    API kiểm tra trạng thái hoạt động của server
+    """
+    model_status = "ready" if ocr_model is not None else "not_initialized"
+    return {
+        "status": "healthy",
+        "model_status": model_status
+    }
+
 @app.post("/ocr")
 async def ocr_image(file: UploadFile = File(...)):
     if ocr_model is None:
