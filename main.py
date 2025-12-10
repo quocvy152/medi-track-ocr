@@ -91,24 +91,50 @@ def group_text_into_lines(boxes, texts, scores, threshold_y=10):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ocr_model
+    import os
+    import logging
+    
+    # Đảm bảo sử dụng CPU-only để tránh OOM
+    os.environ["PADDLE_USE_GPU"] = "0"
+    os.environ["FLAGS_allocator_strategy"] = "naive_best_fit"
+    
     try:
         import paddle
-        if paddle.device.is_compiled_with_cuda():
-             paddle.device.set_device("gpu")
-        else:
-             paddle.device.set_device("cpu")
-        
+        # Luôn sử dụng CPU để tránh OOM trên Render
+        paddle.device.set_device("cpu")
+        print("✓ PaddlePaddle đã được cấu hình để sử dụng CPU")
+    except Exception as e:
+        print(f"⚠ Warning khi cấu hình PaddlePaddle: {e}")
+    
+    try:
+        print("Đang khởi tạo PaddleOCR model...")
         # Tinh chỉnh tham số detection để bắt chữ tiếng Việt tốt hơn
+        # use_gpu=False để đảm bảo sử dụng CPU và tiết kiệm memory
         ocr_model = PaddleOCR(
             use_angle_cls=True, 
             lang="vi",
+            use_gpu=False,  # CPU-only để tránh OOM
             det_db_thresh=0.3,    # Ngưỡng phát hiện (thấp hơn để bắt nét mờ)
             det_db_box_thresh=0.5,# Ngưỡng box
-            det_db_unclip_ratio=1.6 # Tỉ lệ mở rộng box (giúp bắt đủ dấu tiếng Việt)
+            det_db_unclip_ratio=1.6, # Tỉ lệ mở rộng box (giúp bắt đủ dấu tiếng Việt)
+            enable_mkldnn=False,  # Tắt MKLDNN để tránh memory issues
         )
+        print("✓ PaddleOCR model đã được khởi tạo thành công!")
     except Exception as e:
-        pass
+        print(f"❌ Lỗi khi khởi tạo PaddleOCR model: {e}")
+        import traceback
+        traceback.print_exc()
+        ocr_model = None
+    
     yield
+    
+    # Cleanup khi shutdown
+    if ocr_model is not None:
+        try:
+            del ocr_model
+            print("✓ Model đã được cleanup")
+        except:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
@@ -117,10 +143,13 @@ async def health_check():
     """
     API kiểm tra trạng thái hoạt động của server
     """
+    import sys
     model_status = "ready" if ocr_model is not None else "not_initialized"
+    
     return {
-        "status": "healthy",
-        "model_status": model_status
+        "status": "healthy" if model_status == "ready" else "degraded",
+        "model_status": model_status,
+        "python_version": sys.version.split()[0]
     }
 
 @app.post("/ocr")
